@@ -180,6 +180,9 @@ class AscendMetadata:
     seq_lens_cpu: torch.Tensor = None
     seq_lens_list: list[int] = None  # type: ignore
     actual_seq_lengths_q: list[int] = None  # type: ignore
+    expanded_seq_lens_kv: list[int] = None  # type: ignore
+    expanded_seq_lens_q: list[int] = None  # type: ignore
+    _expanded_in_use: bool = False
 
     query_start_loc: torch.Tensor = None
     # Maximum query length in the batch (None for decoding).
@@ -397,6 +400,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self.layerIndex = 0
         self.enable_hamming_sparse = is_enable_hamming_sparse()
 
+    _update_debug_logged = False
+    _capture_debug_logged = False
+    _expansion_debug_logged = False
+
     @staticmethod
     def update_graph_params(
         update_stream,
@@ -407,6 +414,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
         num_dcp_pcp_tokens=None,
         draft_attn_metadatas=None,
     ):
+        if not AscendAttentionBackendImpl._update_debug_logged:
+            AscendAttentionBackendImpl._update_debug_logged = True
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                f"[EAGLE3-DEBUG] update_graph_params called: num_tokens={num_tokens}, "
+                f"num_dcp_pcp_tokens={num_dcp_pcp_tokens}"
+            )
         if using_paged_attention(num_tokens, vllm_config):
             # Paged Attention update logic
             if _EXTRA_CTX.is_draft_model:
@@ -513,10 +528,34 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         draft_step = attn_count // num_layers
                         seq_lens = attn_metadata[draft_step][key].seq_lens_list
                         actual_seq_lengths_q = attn_metadata[draft_step][key].actual_seq_lengths_q
+                        if len(seq_lens) > 1 and len(seq_lens) < actual_seq_lengths_q[-1]:
+                            tokens_per_seq = actual_seq_lengths_q[-1] // len(seq_lens)
+                            expanded = []
+                            for s in seq_lens:
+                                expanded.extend([s] * tokens_per_seq)
+                            seq_lens = expanded
+                            expanded_q = []
+                            for i, cum in enumerate(actual_seq_lengths_q):
+                                start = actual_seq_lengths_q[i - 1] + 1 if i > 0 else 1
+                                for pos in range(start, cum + 1):
+                                    expanded_q.append(pos)
+                            actual_seq_lengths_q = expanded_q
                         attn_count = attn_count + 1
                     else:
                         seq_lens = attn_metadata[key].seq_lens_list
                         actual_seq_lengths_q = attn_metadata[key].actual_seq_lengths_q
+                        if len(seq_lens) > 1 and len(seq_lens) < actual_seq_lengths_q[-1]:
+                            tokens_per_seq = actual_seq_lengths_q[-1] // len(seq_lens)
+                            expanded = []
+                            for s in seq_lens:
+                                expanded.extend([s] * tokens_per_seq)
+                            seq_lens = expanded
+                            expanded_q = []
+                            for i, cum in enumerate(actual_seq_lengths_q):
+                                start = actual_seq_lengths_q[i - 1] + 1 if i > 0 else 1
+                                for pos in range(start, cum + 1):
+                                    expanded_q.append(pos)
+                            actual_seq_lengths_q = expanded_q
 
                     torch.npu.graph_task_update_begin(update_stream, handle)
                     torch_npu.npu_fused_infer_attention_score_v2.out(
@@ -617,6 +656,18 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         draft_step = attn_count // num_layers
                         seq_lens = attn_metadata[draft_step][key].seq_lens_list
                         actual_seq_lengths_q = attn_metadata[draft_step][key].actual_seq_lengths_q
+                        if len(seq_lens) > 1 and len(seq_lens) < actual_seq_lengths_q[-1]:
+                            tokens_per_seq = actual_seq_lengths_q[-1] // len(seq_lens)
+                            expanded = []
+                            for s in seq_lens:
+                                expanded.extend([s] * tokens_per_seq)
+                            seq_lens = expanded
+                            expanded_q = []
+                            for i, cum in enumerate(actual_seq_lengths_q):
+                                start = actual_seq_lengths_q[i - 1] + 1 if i > 0 else 1
+                                for pos in range(start, cum + 1):
+                                    expanded_q.append(pos)
+                            actual_seq_lengths_q = expanded_q
                         block_tables = attn_metadata[draft_step][key].block_tables
                         attn_count = attn_count + 1
                         if not attn_metadata[draft_step][key].causal:
@@ -624,6 +675,18 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     else:
                         seq_lens = attn_metadata[key].seq_lens_list
                         actual_seq_lengths_q = attn_metadata[key].actual_seq_lengths_q
+                        if len(seq_lens) > 1 and len(seq_lens) < actual_seq_lengths_q[-1]:
+                            tokens_per_seq = actual_seq_lengths_q[-1] // len(seq_lens)
+                            expanded = []
+                            for s in seq_lens:
+                                expanded.extend([s] * tokens_per_seq)
+                            seq_lens = expanded
+                            expanded_q = []
+                            for i, cum in enumerate(actual_seq_lengths_q):
+                                start = actual_seq_lengths_q[i - 1] + 1 if i > 0 else 1
+                                for pos in range(start, cum + 1):
+                                    expanded_q.append(pos)
+                            actual_seq_lengths_q = expanded_q
                         # NOTE:
                         # For models with sliding-window attention on the FIA full-graph replay path,
                         # rebinding `block_tables` to the latest metadata tensor causes corrupted /
@@ -634,6 +697,20 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         # block_tables from attn_metadata.
                         if not hasattr(vllm_config.model_config.hf_text_config, "sliding_window"):
                             block_tables = attn_metadata[key].block_tables
+
+                    if not AscendAttentionBackendImpl._expansion_debug_logged:
+                        AscendAttentionBackendImpl._expansion_debug_logged = True
+                        import logging
+                        _logger = logging.getLogger(__name__)
+                        _logger.warning(
+                            f"[EAGLE3-DEBUG] update_graph_params non-sinks replay: "
+                            f"num_tokens={num_tokens}, "
+                            f"num_dcp_pcp_tokens={num_dcp_pcp_tokens}, "
+                            f"len(seq_lens)={len(seq_lens)}, "
+                            f"actual_seq_lengths_q[-1]={actual_seq_lengths_q[-1] if isinstance(actual_seq_lengths_q, list) else 'not_list'}, "
+                            f"is_draft={_EXTRA_CTX.is_draft_model}, "
+                            f"c8_k_aq_scale_is_not_none={c8_k_aq_scale is not None}"
+                        )
 
                     torch.npu.graph_task_update_begin(update_stream, handle)
                     input_layout = "TND"
@@ -648,6 +725,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         }
                         input_layout = "BNSD"
                         sparse_mode = 0
+                        actual_seq_lengths_q = None
+                        pre_tokens = 0
+                        next_tokens = 0
                     torch_npu.npu_fused_infer_attention_score.out(
                         query=query,
                         key=key_cache,
@@ -686,6 +766,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output: torch.Tensor,
         layer=None,
     ) -> torch.Tensor:
+        # DIAGNOSTIC BYPASS: Skip C8 FIA graph capture, use eager path directly.
+        # If this produces correct output, the bug is in the FIA graph
+        # capture/replay mechanism. Remove this block after confirming.
+        if self.enable_c8_quant and layer is not None and attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
+            return self._forward_c8_decode(query, attn_metadata, output, layer), len(attn_metadata.seq_lens_list)
+
         passed_key = key
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(key, value, attn_metadata)
         if self.enable_hamming_sparse and attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
@@ -703,7 +789,19 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 graph_params = get_draft_graph_params()
         else:
             graph_params = get_graph_params()
-        actual_seq_lengths_q = attn_metadata.actual_seq_lengths_q
+        actual_seq_lengths_q = attn_metadata.expanded_seq_lens_q if attn_metadata._expanded_in_use else attn_metadata.actual_seq_lengths_q
+        if not AscendAttentionBackendImpl._capture_debug_logged:
+            AscendAttentionBackendImpl._capture_debug_logged = True
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                f"[EAGLE3-DEBUG] full_graph_fia capture: num_tokens={num_tokens}, "
+                f"len(seq_lens_kv)={len(actual_seq_lengths_kv)}, "
+                f"len(seq_lens_q)={len(actual_seq_lengths_q)}, "
+                f"expanded_in_use={attn_metadata._expanded_in_use}, "
+                f"enable_c8={self.enable_c8_quant}, "
+                f"is_draft={_EXTRA_CTX.is_draft_model}"
+            )
         # Prepare tensors for attention output
         # TODO: Refactor this to step-level instead of layer-level
 
@@ -731,12 +829,22 @@ class AscendAttentionBackendImpl(AttentionImpl):
             key = self._nz_5d_view(self.key_cache, block_size)
             value = self._nz_5d_view(self.value_cache, block_size)
 
-            # TODO: change layerout from BNSD to TND.
+            # Match eager _forward_c8_decode: only process batch_size (target)
+            # tokens, not target+draft tokens, so graph replay shapes match.
+            # Keep original num_tokens as the graph key (must be a valid bucket size).
+            batch_size = len(attn_metadata.seq_lens_list)
             input_layout = "BNSD"
-            query = query.unsqueeze(2)
-            output = output.unsqueeze(2)
+            query = query[:batch_size].unsqueeze(2)
+            output = output[:batch_size].unsqueeze(2)
+            actual_seq_lengths_q = [1] * batch_size
+            actual_seq_lengths_kv = attn_metadata.seq_lens_list
             attn_mask = None
             sparse_mode = 0
+            pre_tokens = 0
+            next_tokens = 0
+
+        # Get workspace from cache or calculate it if not present.
+        workspace = graph_params.workspaces.get(num_tokens)
         if workspace is None:
             workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
                 query=query,
@@ -819,10 +927,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
             **extra_args,
         )
 
-        output = output.view(num_tokens, self.num_heads, self.head_size)
+        if self.enable_c8_quant and layer is not None:
+            output = output.view(batch_size, self.num_heads, self.head_size)
+        else:
+            output = output.view(num_tokens, self.num_heads, self.head_size)
 
         handle = torch.npu.graph_task_group_end(stream)
         graph_params.handles[num_tokens].append(handle)
+        if self.enable_c8_quant and layer is not None:
+            return output, batch_size
         return output, num_tokens
 
     def full_graph_fia_v2(
@@ -834,7 +947,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output: torch.Tensor,
     ) -> torch.Tensor:
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(key, value, attn_metadata)
-        actual_seq_lengths_kv = attn_metadata.seq_lens
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
         if _EXTRA_CTX.is_draft_model:
             graph_params = get_draft_graph_params()
@@ -1043,15 +1155,33 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # EAGLE3 speculative decoding inflates the number of query tokens
         # beyond the number of sequences. The FIA kernel requires
         # len(actual_seq_lengths_kv) >= num_tokens (or == 1).
-        # Expand per-sequence KV lengths to per-token when needed.
+        # Expand per-sequence lengths to per-token when needed.
         if attn_metadata.attn_state != AscendAttentionState.PrefillNoCache:
             num_tokens = attn_metadata.actual_seq_lengths_q[-1]
             kv_len = len(actual_seq_lengths_kv) if isinstance(actual_seq_lengths_kv, list) else actual_seq_lengths_kv.shape[0]
             if kv_len > 1 and kv_len < num_tokens:
-                qsl = attn_metadata.query_start_loc[:kv_len + 1]
-                token_counts = qsl[1:] - qsl[:-1]
-                kv_tensor = torch.tensor(actual_seq_lengths_kv, dtype=torch.int32, device=qsl.device)
-                actual_seq_lengths_kv = torch.repeat_interleave(kv_tensor, token_counts).tolist()
+                tokens_per_seq = num_tokens // kv_len
+                kv_list = actual_seq_lengths_kv if isinstance(actual_seq_lengths_kv, list) else actual_seq_lengths_kv.cpu().tolist()
+                q_list = attn_metadata.actual_seq_lengths_q
+                # Reuse the same list objects on attn_metadata so that graph
+                # replay updates see the expanded values.
+                if attn_metadata.expanded_seq_lens_kv is None or len(attn_metadata.expanded_seq_lens_kv) != num_tokens:
+                    attn_metadata.expanded_seq_lens_kv = [0] * num_tokens
+                if attn_metadata.expanded_seq_lens_q is None or len(attn_metadata.expanded_seq_lens_q) != num_tokens:
+                    attn_metadata.expanded_seq_lens_q = [0] * num_tokens
+                expanded_kv = attn_metadata.expanded_seq_lens_kv
+                expanded_kv.clear()
+                for kv_len_i in kv_list:
+                    expanded_kv.extend([kv_len_i] * tokens_per_seq)
+                expanded_q = attn_metadata.expanded_seq_lens_q
+                expanded_q.clear()
+                for i in range(len(q_list)):
+                    start = (q_list[i - 1] + 1) if i > 0 else 1
+                    end = q_list[i]
+                    for pos in range(start, end + 1):
+                        expanded_q.append(pos)
+                actual_seq_lengths_kv = expanded_kv
+                attn_metadata._expanded_in_use = True
         return key, value, block_size, block_table, actual_seq_lengths_kv
 
     def forward_fused_infer_attention(
