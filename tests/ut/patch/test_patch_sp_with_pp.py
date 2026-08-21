@@ -135,21 +135,44 @@ class TestApply:
 
         assert "sp_pp_forward" not in qwen3_next.Qwen3NextModel.__dict__.get("forward", lambda self: None).__name__
 
-    def test_wrapper_env_flag_mismatch(self):
-        # _wrap_model_init must not touch layers when the predicate is off
+    def test_layer_init_passthrough_when_disabled(self):
+        # _wrap_layer_init must call the original __init__ unchanged when
+        # the predicate is off (PP=1)
+        seen = {}
+
         class Layer:
-            use_attn_reduce_scatter_for_moe = False
+            def __init__(self, vllm_config, prefix=""):
+                seen["pp"] = vllm_config.parallel_config.pipeline_parallel_size
+                self.use_attn_reduce_scatter_for_moe = False
 
-        class Model:
-            vllm_config = FakeVllmConfig(FakeParallelConfig(pipeline_parallel_size=1))
-            layers = [Layer()]
+        sp_pp._wrap_layer_init(Layer)
+        cfg = FakeVllmConfig(FakeParallelConfig(pipeline_parallel_size=1))
+        layer = Layer(cfg)
+        assert seen["pp"] == 1
+        assert layer.use_attn_reduce_scatter_for_moe is False
 
-            def __init__(self):
-                self.touched = False
+    def test_layer_init_uses_pp1_view_when_enabled(self):
+        # with the feature on, the original __init__ must see PP=1 so the
+        # attention projection is built with SP semantics
+        seen = {}
 
-        sp_pp._wrap_model_init(Model, "use_attn_reduce_scatter_for_moe")
-        m = Model()
-        assert m.layers[0].use_attn_reduce_scatter_for_moe is False
+        class Layer:
+            def __init__(self, vllm_config, prefix=""):
+                seen["pp"] = vllm_config.parallel_config.pipeline_parallel_size
+                seen["orig_is_same_object"] = vllm_config.parallel_config is cfg.parallel_config
+                self.use_attn_reduce_scatter_for_moe = (
+                    vllm_config.parallel_config.use_sequence_parallel_moe
+                    and vllm_config.parallel_config.pipeline_parallel_size == 1
+                )
+
+        sp_pp._wrap_layer_init(Layer)
+        cfg = FakeVllmConfig(FakeParallelConfig(pipeline_parallel_size=2))
+        with patch.object(sp_pp, "VLLM_ASCEND_ENABLE_SP_WITH_PP", True):
+            layer = Layer(cfg)
+        assert seen["pp"] == 1
+        # the caller's config object must not be mutated
+        assert cfg.parallel_config.pipeline_parallel_size == 2
+        assert layer.use_attn_reduce_scatter_for_moe is True
 
 
 if __name__ == "__main__":

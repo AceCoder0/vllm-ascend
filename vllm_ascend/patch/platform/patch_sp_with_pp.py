@@ -260,33 +260,40 @@ def _wrap_model_forward(model_cls):
     model_cls.forward = sp_pp_forward
 
 
-def _wrap_model_init(model_cls, flag_attr):
-    orig_init = model_cls.__init__
+def _wrap_layer_init(layer_cls):
+    """Build the layer with SP semantics under PP.
+
+    The SP flag is consumed at construction time: the attention output
+    projection is built with reduce_results=not flag. Overriding the flag
+    after construction cannot rebuild the projection, so instead a
+    pipeline_parallel_size=1 view of the config is handed to the original
+    __init__; the flag it computes under this view is then already correct
+    (including the per-model MoE-layer conditions).
+    """
+    orig_init = layer_cls.__init__
 
     @functools.wraps(orig_init)
-    def sp_pp_init(self, *args, **kwargs):
-        orig_init(self, *args, **kwargs)
-        vllm_config = getattr(self, "vllm_config", None)
-        if vllm_config is None or not sp_with_pp_enabled(vllm_config.parallel_config):
+    def sp_pp_layer_init(self, vllm_config, *args, **kwargs):
+        pc = vllm_config.parallel_config
+        if not sp_with_pp_enabled(pc):
+            orig_init(self, vllm_config, *args, **kwargs)
             return
-        use_sp_moe = vllm_config.parallel_config.use_sequence_parallel_moe
-        for layer in getattr(self, "layers", []):
-            setattr(layer, flag_attr, use_sp_moe)
-        if vllm_config.speculative_config is not None:
-            import logging
+        import copy
 
-            logging.getLogger(__name__).warning(
-                "VLLM_ASCEND_ENABLE_SP_WITH_PP with speculative decoding is "
-                "not validated; output quality is not guaranteed."
-            )
+        cfg_view = copy.copy(vllm_config)
+        pc_view = copy.copy(pc)
+        pc_view.pipeline_parallel_size = 1
+        cfg_view.parallel_config = pc_view
+        orig_init(self, cfg_view, *args, **kwargs)
+        # per-instance gate: only PP>1 instances take the patched forward;
+        # PP=1 instances must stay byte-identical to unpatched vllm
+        self._sp_with_pp_active = True
 
-    model_cls.__init__ = sp_pp_init
+    layer_cls.__init__ = sp_pp_layer_init
 
 
-def apply():
-    if not VLLM_ASCEND_ENABLE_SP_WITH_PP:
-        return
-    from vllm.model_executor.models import deepseek_v2, qwen3_next
+def _install_patches():
+    from vllm.model_executor.models import deepseek_v2, qwen3_5, qwen3_next
 
     # the copied layer forwards reference symbols from the model modules;
     # resolve them against this module's globals
@@ -303,13 +310,52 @@ def apply():
         "vllm DeepseekV2DecoderLayer.forward drifted; update patch_sp_with_pp.py"
     )
 
-    qwen3_next.Qwen3NextDecoderLayer.forward = _qwen3next_layer_forward
-    deepseek_v2.DeepseekV2DecoderLayer.forward = _deepseek_layer_forward
+    _orig_qnext_forward = qwen3_next.Qwen3NextDecoderLayer.forward
+    _orig_dsv2_forward = deepseek_v2.DeepseekV2DecoderLayer.forward
 
-    _wrap_model_init(qwen3_next.Qwen3NextModel, "use_attn_reduce_scatter_for_moe")
+    @functools.wraps(_orig_qnext_forward)
+    def _qnext_forward_gate(self, *args, **kwargs):
+        if not getattr(self, "_sp_with_pp_active", False):
+            return _orig_qnext_forward(self, *args, **kwargs)
+        return _qwen3next_layer_forward(self, *args, **kwargs)
+
+    @functools.wraps(_orig_dsv2_forward)
+    def _dsv2_forward_gate(self, *args, **kwargs):
+        if not getattr(self, "_sp_with_pp_active", False):
+            return _orig_dsv2_forward(self, *args, **kwargs)
+        return _deepseek_layer_forward(self, *args, **kwargs)
+
+    qwen3_next.Qwen3NextDecoderLayer.forward = _qnext_forward_gate
+    deepseek_v2.DeepseekV2DecoderLayer.forward = _dsv2_forward_gate
+
+    # wrap the base first so the subclass's super().__init__ call goes
+    # through the wrapped base
+    _wrap_layer_init(qwen3_next.Qwen3NextDecoderLayer)
+    _wrap_layer_init(qwen3_5.Qwen3_5DecoderLayer)
+    _wrap_layer_init(deepseek_v2.DeepseekV2DecoderLayer)
     _wrap_model_forward(qwen3_next.Qwen3NextModel)
-    _wrap_model_init(deepseek_v2.DeepseekV2Model, "use_sequence_parallel_moe")
     _wrap_model_forward(deepseek_v2.DeepseekV2Model)
 
 
-apply()
+def apply():
+    if not VLLM_ASCEND_ENABLE_SP_WITH_PP:
+        return
+    # Installing the patches requires importing the model modules, which
+    # must NOT happen at platform-plugin registration time: importing
+    # vllm.model_executor.layers.fused_moe before the NPU stack initializes
+    # its MoE kernels leaves the router on the CUDA-only dispatch path.
+    # Defer to the first model-class resolution instead.
+    from vllm.model_executor.models.registry import ModelRegistry
+
+    orig_resolve = ModelRegistry.resolve_model_cls
+    state = {"installed": False}
+
+    @functools.wraps(orig_resolve)
+    def resolve_then_patch(self, *args, **kwargs):
+        out = orig_resolve(self, *args, **kwargs)
+        if not state["installed"]:
+            state["installed"] = True
+            _install_patches()
+        return out
+
+    ModelRegistry.resolve_model_cls = resolve_then_patch
